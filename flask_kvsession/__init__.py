@@ -4,6 +4,7 @@ flask_kvsession is a drop-in replacement module for Flask sessions that uses a
 """
 
 import calendar
+
 try:
     import cPickle as pickle
 except ImportError:
@@ -15,6 +16,7 @@ import re
 from flask import current_app
 from flask.sessions import SessionMixin, SessionInterface
 from itsdangerous import Signer, BadSignature
+from simplekv import TimeToLiveMixin
 from werkzeug.datastructures import CallbackDict
 
 
@@ -30,7 +32,6 @@ class SessionID(object):
                     None will result in :meth:`~datetime.datetime.utcnow()` to
                     be used.
     """
-
     def __init__(self, id, created=None):
         if None == created:
             created = datetime.utcnow()
@@ -53,8 +54,8 @@ class SessionID(object):
 
     def serialize(self):
         """Serializes to the standard form of ``KEY_CREATED``"""
-        return '%x_%x' % (self.id, calendar.timegm(self.created.utctimetuple())
-                          )
+        return '%x_%x' % (self.id,
+                          calendar.timegm(self.created.utctimetuple()))
 
     @classmethod
     def unserialize(cls, string):
@@ -72,6 +73,7 @@ class KVSession(CallbackDict, SessionMixin):
     # upon modification, we set this manually through _on_update (see
     # __init__)
     modified = False
+
     """Replacement session class.
 
     Instances of this class will replace the session (and thus be available
@@ -79,7 +81,6 @@ class KVSession(CallbackDict, SessionMixin):
 
     The session class will save data to the store only when necessary, empty
     sessions will not be stored at all."""
-
     def __init__(self, initial=None):
         def _on_update(d):
             d.modified = True
@@ -128,12 +129,21 @@ class KVSessionInterface(SessionInterface):
     serialization_method = pickle
     session_class = KVSession
 
+    def _session_has_expired(self, sid, app):
+
+        if getattr(app.kvsession_store, 'ttl_support', False):
+            return False
+
+        return sid.has_expired(app.config['PERMANENT_SESSION_LIFETIME'])
+
     def open_session(self, app, request):
         key = app.secret_key
 
         if key is not None:
             session_cookie = request.cookies.get(
-                app.config['SESSION_COOKIE_NAME'], None)
+                app.config['SESSION_COOKIE_NAME'],
+                None
+            )
 
             s = None
 
@@ -142,10 +152,11 @@ class KVSessionInterface(SessionInterface):
                     # restore the cookie, if it has been manipulated,
                     # we will find out here
                     sid_s = Signer(app.secret_key).unsign(
-                        session_cookie).decode('ascii')
+                        session_cookie
+                    ).decode('ascii')
                     sid = SessionID.unserialize(sid_s)
 
-                    if sid.has_expired(app.permanent_session_lifetime):
+                    if self._session_has_expired(sid, app):
                         # we reach this point if a "non-permanent" session has
                         # expired, but is made permanent. silently ignore the
                         # error with a new session
@@ -153,7 +164,8 @@ class KVSessionInterface(SessionInterface):
 
                     # retrieve from store
                     s = self.session_class(self.serialization_method.loads(
-                        current_app.kvsession_store.get(sid_s)))
+                        current_app.kvsession_store.get(sid_s)
+                    ))
                     s.sid_s = sid_s
                 except (BadSignature, KeyError):
                     # either the cookie was manipulated or we did not find the
@@ -174,7 +186,9 @@ class KVSessionInterface(SessionInterface):
             if not getattr(session, 'sid_s', None):
                 session.sid_s = SessionID(
                     current_app.config['SESSION_RANDOM_SOURCE'].getrandbits(
-                        app.config['SESSION_KEY_BITS'])).serialize()
+                        app.config['SESSION_KEY_BITS']
+                    )
+                ).serialize()
 
             # save the session, now its no longer new (or modified)
             data = self.serialization_method.dumps(dict(session))
@@ -192,7 +206,8 @@ class KVSessionInterface(SessionInterface):
 
             # save sid_s in cookie
             cookie_data = Signer(app.secret_key).sign(
-                session.sid_s.encode('ascii'))
+                session.sid_s.encode('ascii')
+            )
 
             response.set_cookie(key=app.config['SESSION_COOKIE_NAME'],
                                 value=cookie_data,
@@ -228,13 +243,13 @@ class KVSessionExtension(object):
         configured appropriately (see :class:`~simplekv.TimeToLiveMixin`).
 
         This function retrieves all session keys, checks they are older than
-        :attr:`flask.Flask.permanent_session_lifetime` and if so, removes them.
+        ``PERMANENT_SESSION_LIFETIME`` and if so, removes them.
 
         Note that no distinction is made between non-permanent and permanent
         sessions.
 
         :param app: The app whose sessions should be cleaned up. If ``None``,
-                    uses :py:data:`~flask.current_app`."""
+                    uses :py:attr:`flask.current_app`."""
 
         if not app:
             app = current_app
@@ -246,7 +261,10 @@ class KVSessionExtension(object):
                 sid = SessionID.unserialize(key)
 
                 # remove if expired
-                if sid.has_expired(app.permanent_session_lifetime, now):
+                if sid.has_expired(
+                    app.config['PERMANENT_SESSION_LIFETIME'],
+                    now
+                ):
                     app.kvsession_store.delete(key)
 
     def init_app(self, app, session_kvstore=None):
